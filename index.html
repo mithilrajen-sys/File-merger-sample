@@ -302,6 +302,14 @@ function readRows(fileObj) {
   });
 }
 
+// Output order of the student-detail columns (they appear before the questions).
+// Names must match the output headings used in COLUMN_MAPPING / RENAME_COLUMNS.
+const FRONT_ORDER = [
+  'First name', 'Middle Name', 'Last name', 'Suffix', 'Email', 'Parent Email', 'Teacher LastName',
+  'Address 1', 'Address 2', 'City', 'State', 'ZIP', 'ZIP4',
+  'BirthMonth', 'BirthDay', 'BirthYear', 'GradYear', 'Grade Average', 'Gender'
+];
+
 // Matches question columns like Q1, Q1.1, Q2, Q10.3 (optionally followed by text)
 const QUESTION_RE = /^Q\s*(\d+(?:\.\d+)*)/i;
 
@@ -337,27 +345,23 @@ function cleanAndReorder(rows) {
   // 2. Drop columns with an empty heading
   const kept = headers.filter(h => !isBlankHeader(h));
 
-  // 3. Split out questions (sorted) and Parent Email
-  const questions = kept.filter(h => questionKey(h)).sort(compareQuestions);
-  const parentEmail = kept.find(h => h.trim().toLowerCase() === 'parent email');
+  // 3. Three groups: ID columns (anything else), student details (fixed order), questions (sorted)
+  const norm = s => s.trim().toLowerCase();
+  const frontSet = new Set(FRONT_ORDER.map(norm));
+  const questions = kept.filter(h => questionKey(h) && !frontSet.has(norm(h))).sort(compareQuestions);
+  const questionSet = new Set(questions);
 
-  // 4. Rebuild order: everything else stays put; Parent Email + sorted questions
-  //    are placed together where the first question column was
-  const ordered = [];
-  let placed = false;
-  kept.forEach(h => {
-    if (h === parentEmail || questionKey(h)) {
-      if (!placed && questions.length) {
-        if (parentEmail) ordered.push(parentEmail);
-        ordered.push(...questions);
-        placed = true;
-      } else if (!questions.length && h === parentEmail) {
-        ordered.push(h);   // no questions found: leave Parent Email where it was
-      }
-      return;
-    }
-    ordered.push(h);
+  const front = [];
+  FRONT_ORDER.forEach(f => {
+    const found = kept.find(h => norm(h) === norm(f));
+    if (found) front.push(found);
   });
+  const frontFound = new Set(front);
+
+  const others = kept.filter(h => !frontFound.has(h) && !questionSet.has(h));
+
+  // 4. Final order: SurveyYear, SurveyType, EVID, Form... → student details → questions
+  const ordered = [...others, ...front, ...questions];
 
   // 5. Rebuild each row in the new column order
   return rows.map(r => {
