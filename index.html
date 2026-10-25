@@ -62,6 +62,8 @@
     <div class="w-full bg-slate-200 dark:bg-slate-700 h-2 rounded-full overflow-hidden"><div id="progBar" class="bg-blue-600 h-full w-0 transition-all"></div></div>
   </div>
 
+  <div id="warn" class="hidden p-4 rounded-2xl border text-sm space-y-1"></div>
+
   <section class="grid grid-cols-2 sm:grid-cols-4 gap-3">
     <div class="bg-white dark:bg-slate-800 p-4 rounded-2xl border border-slate-200 dark:border-slate-700"><div id="sFolders" class="text-xl font-bold">0</div><div class="text-xs text-slate-500">Folders Found</div></div>
     <div class="bg-white dark:bg-slate-800 p-4 rounded-2xl border border-slate-200 dark:border-slate-700"><div id="sKeys" class="text-xl font-bold">0</div><div class="text-xs text-slate-500">Indexed Records</div></div>
@@ -101,6 +103,7 @@ const state = {
   downloads: 0,
   lastData: null,
   lastName: '',
+  missingByFolder: {},
   busy: false
 };
 
@@ -183,6 +186,8 @@ $('folderInput').addEventListener('change', e => {
   const files = Array.from(e.target.files);
   if (!files.length) return;
   state.foldersMap = {};
+  state.missingByFolder = {};
+  $('warn').classList.add('hidden');
 
   files.forEach(file => {
     const isExcel = /\.(xlsx|xls)$/i.test(file.name);
@@ -280,6 +285,13 @@ function renderCards() {
       <div class="flex items-center justify-between mb-3"><span class="text-2xl">📁</span>
         <span class="text-xs font-semibold px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-700">${count} Excel file(s)</span></div>
       <h4 class="font-bold truncate">${esc(name)}</h4>
+      ${(() => {
+        const m = state.missingByFolder[name];
+        if (!m) return '';
+        return m.count
+          ? `<p class="text-xs text-amber-600 font-semibold mt-1">⚠️ ${m.count} missing: ${esc(m.ranges.map(fmtRange).join(', '))}</p>`
+          : `<p class="text-xs text-emerald-600 font-semibold mt-1">✅ Complete</p>`;
+      })()}
       <p class="text-xs text-blue-600 font-medium mt-3">▶ Merge &amp; Export Output ⬇</p>`;
     b.onclick = () => mergeAndDownload(name);
     $('grid').appendChild(b);
@@ -371,6 +383,50 @@ function cleanAndReorder(rows) {
   });
 }
 
+// ---------- Missing record detection ----------
+// Turns [201,202,203,205] into [[201,203],[205,205]]
+function toRanges(nums) {
+  const out = [];
+  nums.forEach(n => {
+    const last = out[out.length - 1];
+    if (last && n === last[1] + 1) last[1] = n;
+    else out.push([n, n]);
+  });
+  return out;
+}
+
+const pad5 = n => String(n).padStart(5, '0');
+const fmtRange = ([a, b]) => a === b ? pad5(a) : `${pad5(a)}–${pad5(b)}`;
+
+// forms: Set of Form numbers found in the data
+// declared: [[start,end], ...] ranges read from file names like "260NJB7G0__001-051_.xlsx"
+function computeMissing(forms, declared) {
+  if (!forms.size && !declared.length) return [];
+  const all = [...forms, ...declared.flat()];
+  const lo = Math.min(...all), hi = Math.max(...all);
+  if (hi - lo > 200000) return [];   // safety guard against bad data
+  const missing = [];
+  for (let n = lo; n <= hi; n++) if (!forms.has(n)) missing.push(n);
+  return toRanges(missing);
+}
+
+function showWarning(folder, ranges, presentCount) {
+  const box = $('warn');
+  box.classList.remove('hidden', 'border-amber-300', 'bg-amber-50', 'text-amber-900',
+    'border-emerald-300', 'bg-emerald-50', 'text-emerald-900');
+  if (!ranges.length) {
+    box.classList.add('border-emerald-300', 'bg-emerald-50', 'text-emerald-900');
+    box.innerHTML = `<p class="font-semibold">✅ ${esc(folder)}: sequence is complete (${presentCount} records, no gaps)</p>`;
+    return;
+  }
+  const total = ranges.reduce((s, [a, b]) => s + (b - a + 1), 0);
+  box.classList.add('border-amber-300', 'bg-amber-50', 'text-amber-900');
+  box.innerHTML = `
+    <p class="font-semibold">⚠️ ${esc(folder)} is missing ${total} record(s)</p>
+    <p class="text-xs">Missing Form numbers: <span class="font-mono font-semibold">${ranges.map(r => esc(fmtRange(r))).join(', ')}</span></p>
+    <p class="text-xs opacity-80">Found ${presentCount} records. Add the missing file(s) to the folder and merge again.</p>`;
+}
+
 async function mergeAndDownload(folder) {
   if (state.busy) return;
 
@@ -384,9 +440,13 @@ async function mergeAndDownload(folder) {
 
   const mergedRows = [];
   let matchedCount = 0;
+  const formNums = new Set();
+  const declared = [];
 
   for (let i = 0; i < files.length; i++) {
     progress(Math.round(((i + 1) / files.length) * 90), `Processing file ${i + 1}/${files.length}...`);
+    const rangeMatch = files[i].name.match(/(\d+)\s*-\s*(\d+)/);   // e.g. 001-051 in the file name
+    if (rangeMatch) declared.push([parseInt(rangeMatch[1], 10), parseInt(rangeMatch[2], 10)]);
     try {
       const rows = await readRows(files[i].fileObject);
 
@@ -402,6 +462,8 @@ async function mergeAndDownload(folder) {
         }
 
         const last5 = extractLast5Digits(formVal);
+        const formNum = parseInt(last5, 10);
+        if (!isNaN(formNum)) formNums.add(formNum);
         const refData = state.refBy5DigitMap.get(last5) || {};
 
         if (state.refBy5DigitMap.has(last5)) {
@@ -458,7 +520,15 @@ async function mergeAndDownload(folder) {
   updateStats();
   renderPreview(finalRows, folder);
 
-  toast(`Merged ${files.length} files (${finalRows.length} rows)! ${matchedCount} matched and mapped.`);
+  const missingRanges = computeMissing(formNums, declared);
+  const missingCount = missingRanges.reduce((s, [a, b]) => s + (b - a + 1), 0);
+  state.missingByFolder[folder] = { count: missingCount, ranges: missingRanges };
+  showWarning(folder, missingRanges, formNums.size);
+  renderCards();
+
+  toast(missingCount
+    ? `⚠️ Merged ${finalRows.length} rows, but ${missingCount} record(s) are missing: ${missingRanges.map(fmtRange).join(', ')}`
+    : `Merged ${files.length} files (${finalRows.length} rows)! ${matchedCount} matched and mapped.`);
   state.busy = false;
 }
 
