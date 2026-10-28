@@ -13,7 +13,7 @@
 <header class="sticky top-0 z-30 bg-white/80 dark:bg-slate-800/80 backdrop-blur border-b border-slate-200 dark:border-slate-700 px-4 py-3 flex items-center justify-between">
   <div>
     <h1 class="font-bold text-lg">📊 Excel Merger Pro</h1>
-    <p class="text-xs text-slate-500">Direct Column H:N & R:AC Mapping Engine</p>
+    <p class="text-xs text-slate-500">Direct Column G:M & Q:AB Mapping Engine</p>
   </div>
   <div class="flex items-center gap-2">
     <label for="folderInput" class="px-3.5 py-2 rounded-xl text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white cursor-pointer">📂 Open Directory</label>
@@ -98,7 +98,10 @@ const state = {
   foldersMap: {},
   referenceOrder: [],
   referenceFileName: '',
-  refBy5DigitMap: new Map(),
+  refBy5DigitMap: new Map(),   // key = EVID + 5-digit Form  (e.g. 270R02RF0 + 00001)
+  refRank: new Map(),          // key -> original order in the reference sheet
+  refEvids: new Set(),         // all EVIDs found in reference column B
+  refCount: 0,                 // number of reference rows indexed
   filter: '',
   downloads: 0,
   lastData: null,
@@ -112,6 +115,11 @@ const $ = id => document.getElementById(id);
 function cleanStr(v) {
   if (v === undefined || v === null) return '';
   return String(v).trim();
+}
+
+// Normalise an ID for matching: trim, remove spaces, uppercase
+function normKey(v) {
+  return cleanStr(v).replace(/\s+/g, '').toUpperCase();
 }
 
 function extractLast5Digits(text) {
@@ -177,7 +185,7 @@ const hideProgress = () => $('progress').classList.add('hidden');
 
 function updateStats() {
   $('sFolders').textContent = Object.keys(state.foldersMap).length;
-  $('sKeys').textContent = state.refBy5DigitMap.size;
+  $('sKeys').textContent = state.refCount;
   $('sRows').textContent = state.lastData ? state.lastData.length - 1 : 0;
   $('sDl').textContent = state.downloads;
 }
@@ -213,10 +221,13 @@ function parseReference(rows) {
   const refHeaders = rawHeaders.map((c, idx) => cleanStr(c) || `Col_${idx}`);
   
   const targetIndices = [];
-  for (let i = 7; i <= 13; i++) targetIndices.push(i);
-  for (let i = 17; i <= 28; i++) targetIndices.push(i);
+  for (let i = 6; i <= 12; i++) targetIndices.push(i);    // G:M  → First Name ... Teacher Name
+  for (let i = 16; i <= 27; i++) targetIndices.push(i);   // Q:AB → Address 1 ... Gender
 
   state.refBy5DigitMap = new Map();
+  state.refRank = new Map();
+  state.refEvids = new Set();
+  state.refCount = 0;
   state.referenceOrder = [];
 
   for (let i = headerRowIdx + 1; i < rows.length; i++) {
@@ -230,27 +241,35 @@ function parseReference(rows) {
       if (h && val) rowObj[h.trim()] = val;
     });
 
-    const tifVal = cleanStr(r[2]);
-    const last5 = extractLast5Digits(tifVal);
+    // Column B = EVID, Column C = EVID + Form (e.g. 270R02RF000001)
+    const evid = normKey(r[1]);
+    const fullKey = normKey(r[2]);
+    const formPart = extractLast5Digits(r[2]);
+    const key = (evid && formPart) ? evid + formPart : fullKey;
+    if (!key) continue;
 
-    if (last5) {
-      const existing = state.refBy5DigitMap.get(last5) || {};
-      state.refBy5DigitMap.set(last5, { ...existing, ...rowObj });
-      if (!state.referenceOrder.includes(last5)) {
-        state.referenceOrder.push(last5);
-      }
-    }
+    if (evid) state.refEvids.add(evid);
+    state.refCount++;
+
+    const keys = new Set([key]);
+    if (fullKey) keys.add(fullKey);          // also index by the exact text in column C
+    const rank = state.refRank.size;
+    keys.forEach(k => {
+      const existing = state.refBy5DigitMap.get(k) || {};
+      state.refBy5DigitMap.set(k, { ...existing, ...rowObj });
+      if (!state.refRank.has(k)) state.refRank.set(k, rank);
+    });
   }
 
-  $('refStatus').textContent = `✓ ${state.refBy5DigitMap.size} records indexed`;
+  $('refStatus').textContent = `✓ ${state.refCount} records indexed`;
   $('refStatus').className = 'text-xs px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800';
   
   $('diag').classList.remove('hidden');
   $('diagHeader').textContent = `Mapped Fields: First Name, Last Name, Address, Email, Birth Date, Grade Aver, Gender, etc.`;
-  $('diagTif').textContent = `Total Indexed 5-Digit Form Keys: ${state.refBy5DigitMap.size}`;
+  $('diagTif').textContent = `Match key: EVID (ref col B) + Form (ref col C) → ${state.refCount} records, ${state.refEvids.size} unique EVIDs`;
 
   updateStats();
-  toast(`Reference survey file indexed successfully (${state.refBy5DigitMap.size} records)!`);
+  toast(`Reference survey file indexed successfully (${state.refCount} records)!`);
 }
 
 $('refFile').addEventListener('change', e => {
@@ -427,6 +446,25 @@ function showWarning(folder, ranges, presentCount) {
     <p class="text-xs opacity-80">Found ${presentCount} records. Add the missing file(s) to the folder and merge again.</p>`;
 }
 
+// Adds a line to the dashboard panel about rows that did not match the reference sheet
+function appendMatchNote(rows, evids) {
+  if (!state.refBy5DigitMap.size) return;
+  const box = $('warn');
+  if (!rows) {
+    box.insertAdjacentHTML('beforeend',
+      '<p class="text-xs">🔗 All rows matched the reference sheet (EVID + Form).</p>');
+    return;
+  }
+  box.classList.remove('border-emerald-300', 'bg-emerald-50', 'text-emerald-900');
+  box.classList.add('border-amber-300', 'bg-amber-50', 'text-amber-900');
+  const list = [...evids];
+  const evidText = list.length
+    ? `EVID not found in reference column B: <span class="font-mono font-semibold">${list.map(esc).join(', ')}</span>`
+    : 'The EVID exists in the reference, but that EVID + Form combination was not found.';
+  box.insertAdjacentHTML('beforeend',
+    `<p class="text-xs mt-1">🔗 ${rows} row(s) had no match in the reference sheet. ${evidText}</p>`);
+}
+
 async function mergeAndDownload(folder) {
   if (state.busy) return;
 
@@ -440,6 +478,8 @@ async function mergeAndDownload(folder) {
 
   const mergedRows = [];
   let matchedCount = 0;
+  let unmatchedRows = 0;
+  const unmatchedEvids = new Set();
   const formNums = new Set();
   const declared = [];
 
@@ -461,13 +501,29 @@ async function mergeAndDownload(folder) {
           }
         }
 
+        // EVID column (C in the output)
+        let evidVal = '';
+        for (const k in row) {
+          if (k.trim().toLowerCase() === 'evid') {
+            evidVal = row[k];
+            if (evidVal) break;
+          }
+        }
+        const evid = normKey(evidVal);
+
         const last5 = extractLast5Digits(formVal);
         const formNum = parseInt(last5, 10);
         if (!isNaN(formNum)) formNums.add(formNum);
-        const refData = state.refBy5DigitMap.get(last5) || {};
 
-        if (state.refBy5DigitMap.has(last5)) {
+        // Combine EVID (col C) + Form (col D) and look it up in the reference sheet
+        const key = evid + last5;
+        const refData = state.refBy5DigitMap.get(key) || {};
+
+        if (state.refBy5DigitMap.has(key)) {
           matchedCount++;
+        } else if (state.refBy5DigitMap.size > 0) {
+          unmatchedRows++;
+          if (evid && !state.refEvids.has(evid)) unmatchedEvids.add(evid);
         }
 
         // Rename columns and drop unwanted ones (e.g. Mobile Phone)
@@ -490,7 +546,7 @@ async function mergeAndDownload(folder) {
           }
         }
 
-        const rank = state.referenceOrder.indexOf(last5);
+        const rank = state.refRank.has(key) ? state.refRank.get(key) : -1;
         combined['_sortRank'] = rank !== -1 ? rank : 999999;
 
         mergedRows.push(combined);
@@ -524,10 +580,14 @@ async function mergeAndDownload(folder) {
   const missingCount = missingRanges.reduce((s, [a, b]) => s + (b - a + 1), 0);
   state.missingByFolder[folder] = { count: missingCount, ranges: missingRanges };
   showWarning(folder, missingRanges, formNums.size);
+  appendMatchNote(unmatchedRows, unmatchedEvids);
   renderCards();
 
-  toast(missingCount
-    ? `⚠️ Merged ${finalRows.length} rows, but ${missingCount} record(s) are missing: ${missingRanges.map(fmtRange).join(', ')}`
+  const parts = [];
+  if (missingCount) parts.push(`${missingCount} record(s) missing: ${missingRanges.map(fmtRange).join(', ')}`);
+  if (unmatchedRows) parts.push(`${unmatchedRows} row(s) not found in reference`);
+  toast(parts.length
+    ? `⚠️ Merged ${finalRows.length} rows. ${parts.join(' | ')}`
     : `Merged ${files.length} files (${finalRows.length} rows)! ${matchedCount} matched and mapped.`);
   state.busy = false;
 }
